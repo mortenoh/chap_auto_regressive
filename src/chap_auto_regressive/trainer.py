@@ -62,6 +62,8 @@ class Trainer:
         learning_rate: float = 1e-5,
         validation_loader: Optional[DataLoader] = None,
         seed: int = 0,
+        eval_every: int = 5,
+        patience: int = 6,
     ):
         """Configure the trainer.
 
@@ -73,12 +75,23 @@ class Trainer:
                 periodic validation-loss reporting.
             seed: Seed for parameter initialization and dropout, so independently
                 seeded trainers yield distinct ensemble members.
+            eval_every: Epochs between validation evaluations.
+            patience: Stop after this many consecutive evaluations without a new
+                best validation loss. Only active when a validation loader is
+                supplied; ``0`` disables stopping and restores the previous
+                fixed-length behaviour.
         """
         self.model = model
         self.n_iter = n_iter
         self.learning_rate = learning_rate
         self._validation_loader = validation_loader
         self.seed = seed
+        self.eval_every = eval_every
+        self.patience = patience
+        #: Epoch at which the best validation loss was seen, set by ``train``.
+        self.best_epoch: Optional[int] = None
+        #: The best validation loss seen, set by ``train``.
+        self.best_validation_loss: Optional[float] = None
 
     def train(self, data_loader: DataLoader, loss_fn: Callable) -> "TrainState":
         """Train the model and return the final state.
@@ -122,18 +135,36 @@ class Trainer:
         def get_validation_loss(state: TrainState, x, ar_y, y):
             return loss_fn(state.apply_fn(state.params, x, ar_y, training=False), y)
 
+        def validation_loss() -> float:
+            total = 0.0
+            for v_x, v_ar, v_y in iter(self._validation_loader):
+                total += float(get_validation_loss(training_state, v_x, v_ar, v_y))
+            return total
+
+        best_state, best_loss, best_epoch, since_best = training_state, float("inf"), 0, 0
         for i in range(self.n_iter):
-            total_loss = 0
             for x, ar_y, y in iter(data_loader):
                 training_state, cur_loss = train_step(training_state, dropout_key, x, ar_y, y)
-                total_loss += cur_loss
-            if i % 10 == 0:
-                validation_loss = 0
-                if self._validation_loader is not None:
-                    v_loss = 0
-                    for v_x, v_ar, v_y in iter(self._validation_loader):
-                        v_loss += get_validation_loss(training_state, v_x, v_ar, v_y)
-                    validation_loss = v_loss
-                logger.info("epoch %d: loss=%s validation_loss=%s", i, cur_loss, validation_loss)
+            if self._validation_loader is None:
+                if i % 10 == 0:
+                    logger.info("epoch %d: loss=%s", i, cur_loss)
+                continue
+            if i % self.eval_every:
+                continue
+            current = validation_loss()
+            logger.info("epoch %d: loss=%s validation_loss=%s", i, cur_loss, current)
+            if current < best_loss:
+                # Keeping the best parameters, not the last, is the whole point:
+                # held-out loss on these series bottoms out early and then climbs
+                # for the rest of the run.
+                best_state, best_loss, best_epoch, since_best = training_state, current, i, 0
+                continue
+            since_best += 1
+            if self.patience and since_best >= self.patience:
+                logger.info("early stopping at epoch %d; best was epoch %d (%.4f)", i, best_epoch, best_loss)
+                break
 
-        return training_state
+        if self._validation_loader is None:
+            return training_state
+        self.best_epoch, self.best_validation_loss = best_epoch, best_loss
+        return best_state

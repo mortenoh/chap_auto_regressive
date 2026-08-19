@@ -9,6 +9,7 @@ from chap_auto_regressive.transforms import REQUIRED_COVARIATES, get_series
 def _small_trained_model():
     train_df = _frame(["A", "B"], [f"2020-{m:02d}" for m in range(1, 13)])
     model = AutoRegressiveModel()
+    model.early_stopping = False  # tiny fixtures: exercise IO, not training length
     model.context_length = 4
     model.prediction_length = 2
     model.n_iter = 2
@@ -55,6 +56,7 @@ def test_train_predict_roundtrip_returns_sample_frame():
     future_df = _frame(["A", "B"], future_months, with_target=False, seed=1)
 
     model = AutoRegressiveModel()
+    model.early_stopping = False  # tiny fixtures: exercise IO, not training length
     model.context_length = 4
     model.prediction_length = 2
     model.n_iter = 2
@@ -142,6 +144,7 @@ def test_set_validation_data_requires_observed_cases():
     # Validation loss is computed against observed cases, so a future without a
     # disease_cases column must fail with a clear message (not a cryptic concat).
     model = AutoRegressiveModel()
+    model.early_stopping = False  # tiny fixtures: exercise IO, not training length
     model.context_length, model.prediction_length = 4, 2
     historic = _frame(["A", "B"], [f"2020-{m:02d}" for m in range(1, 7)])
     future_no_target = _frame(["A", "B"], ["2020-07", "2020-08"], with_target=False, seed=3)
@@ -186,6 +189,7 @@ def test_validation_features_are_scaled_after_train():
     # the reported validation loss is computed on raw features and is not
     # comparable to the training loss.
     model = AutoRegressiveModel()
+    model.early_stopping = False  # tiny fixtures: exercise IO, not training length
     model.context_length, model.prediction_length, model.n_iter = 4, 2, 2
     model.n_ensemble = 1
     historic = _frame(["A", "B"], [f"2020-{m:02d}" for m in range(1, 7)])
@@ -205,6 +209,7 @@ def test_ensemble_trains_pools_and_roundtrips(tmp_path):
     train_df = _frame(["A", "B"], [f"2020-{m:02d}" for m in range(1, 13)])
     future = _frame(["A", "B"], ["2021-01", "2021-02"], with_target=False, seed=1)
     model = AutoRegressiveModel()
+    model.early_stopping = False  # tiny fixtures: exercise IO, not training length
     model.context_length, model.prediction_length, model.n_iter = 4, 2, 2
     model.n_ensemble = 3
     predictor = model.train(train_df)
@@ -231,6 +236,7 @@ def test_covariates_property_appends_additional_after_required():
     # The required covariates always lead, exactly once; an additional name that
     # duplicates a required one is ignored so it is never counted twice.
     model = AutoRegressiveModel()
+    model.early_stopping = False  # tiny fixtures: exercise IO, not training length
     assert model.covariates == REQUIRED_COVARIATES  # default: just the required three
     model.additional_covariates = ["relative_humidity", "rainfall"]  # rainfall is required
     assert model.covariates == REQUIRED_COVARIATES + ("relative_humidity",)
@@ -261,6 +267,7 @@ def test_train_predict_roundtrip_with_additional_covariate(tmp_path):
     future_df = _add_covariate(_frame(["A", "B"], future_months, with_target=False, seed=1))
 
     model = AutoRegressiveModel()
+    model.early_stopping = False  # tiny fixtures: exercise IO, not training length
     model.context_length, model.prediction_length, model.n_iter = 4, 2, 2
     model.n_ensemble = 1
     model.additional_covariates = ["relative_humidity"]
@@ -289,6 +296,7 @@ def test_saved_predictor_rebuilds_its_architecture(tmp_path):
     train_df = _frame(["A", "B"], [f"2020-{m:02d}" for m in range(1, 13)])
     future = _frame(["A", "B"], ["2021-01", "2021-02"], with_target=False, seed=1)
     model = AutoRegressiveModel()
+    model.early_stopping = False  # tiny fixtures: exercise IO, not training length
     model.context_length, model.prediction_length, model.n_iter, model.n_ensemble = 4, 2, 2, 1
     model.cell, model.rnn_features, model.head_features = "simple", 5, 7  # non-default architecture
     predictor = model.train(train_df)
@@ -310,6 +318,7 @@ def test_stacked_rnn_layers_train_and_predict():
     train_df = _frame(["A", "B"], [f"2020-{m:02d}" for m in range(1, 13)])
     future = _frame(["A", "B"], ["2021-01", "2021-02"], with_target=False, seed=1)
     model = AutoRegressiveModel()
+    model.early_stopping = False  # tiny fixtures: exercise IO, not training length
     model.context_length, model.prediction_length, model.n_iter, model.n_ensemble = 4, 2, 2, 1
     model.rnn_layers = 2
     predictor = model.train(train_df)

@@ -11,6 +11,7 @@ The public API speaks tidy :class:`pandas.DataFrame` objects (one row per locati
 and time period); the model itself has no dependency on chap-core.
 """
 
+import logging
 import pickle
 from typing import Any, Callable, Sequence
 
@@ -25,6 +26,8 @@ from .distributions import nb_head
 from .rnn_model import build_network
 from .trainer import Trainer
 from .transforms import REQUIRED_COVARIATES, ZScaler, get_series, location_groups
+
+logger = logging.getLogger(__name__)
 
 
 def _check_predict_inputs(
@@ -293,6 +296,25 @@ class AutoRegressiveModel:
     context_length = 36
     learning_rate = 1e-3
     n_ensemble: int = 5
+    # Offsets every ensemble member's seed. The model is otherwise fully
+    # deterministic, so without this two runs of the same configuration are
+    # bit-identical and the seed variance -- the noise floor any change has to
+    # clear -- cannot be measured at all.
+    seed_offset: int = 0
+    # --- early stopping ---
+    # Held-out loss on these series bottoms out around epoch 30 and then climbs
+    # for the remaining 370, so training to a fixed n_iter costs 1.3-2.5 nats.
+    # Each member first fits on all but the held-out tail to find its own best
+    # epoch, then refits on the full series for that many epochs -- so no data is
+    # permanently given up, and the usual run is several times cheaper than the
+    # fixed-length one it replaces.
+    early_stopping: bool = True
+    #: Extra periods the held-out block gets on top of the one window it must
+    #: contain, so the block spans ``context_length + prediction_length +
+    #: validation_periods`` periods and yields ``validation_periods + 1`` windows.
+    validation_periods: int = 12
+    patience: int = 6
+    eval_every: int = 5
     additional_covariates: Sequence[str] = ()
     # --- network architecture (persisted in the saved predictor) ---
     cell: str = "gru"
@@ -400,6 +422,59 @@ class AutoRegressiveModel:
             DLDataSet(full_x, full_y, forecast_length=self.prediction_length, context_length=self.context_length)
         )
 
+    def _early_stopping_loaders(self, data: pd.DataFrame) -> tuple | None:
+        """Split the tail off the training series to select a stopping epoch.
+
+        The split is contiguous and final in time -- a random split would let the
+        auto-regressive input see the future -- and the feature scaler is fitted on
+        the earlier part only. Returns ``None`` when early stopping is switched
+        off or when the caller supplied its own validation window.
+
+        A window spans ``context_length + prediction_length`` periods, and both
+        sides of the split need at least one, so early stopping needs at least
+        twice that many periods -- 78 months at the default 36 + 3. Too short a
+        series raises rather than falling back to fixed-length training: the
+        fallback is the overtraining this feature exists to prevent, and it would
+        happen silently, since chap runs training in a subprocess whose logs the
+        caller never sees.
+
+        Args:
+            data: The training frame.
+
+        Raises:
+            ValueError: If the series is too short to hold out a validation window.
+
+        Returns:
+            A ``(fit_loader, validation_loader)`` pair, or ``None``.
+        """
+        if not self.early_stopping or self._validation_loader is not None:
+            return None
+        x, y = get_series(data, self.covariates)
+        total_length = self.context_length + self.prediction_length
+        # validation_periods is the *extra* history the held-out block gets beyond
+        # the single window it must contain, so the knob has an effect at every
+        # setting rather than being swallowed by a max() against the window size.
+        n_validation = total_length + max(self.validation_periods, 0)
+        split = x.shape[1] - n_validation
+        if split < total_length:
+            raise ValueError(
+                f"early stopping needs at least {n_validation + total_length} periods "
+                f"(a {total_length}-period window to train on and {n_validation} held out), "
+                f"but the shortest series has {x.shape[1]}. Either shorten context_length, "
+                f"lower validation_periods (currently {self.validation_periods}), or set "
+                f"early_stopping=False to train for a fixed n_iter={self.n_iter}."
+            )
+        fit_set = DLDataSet(
+            x[:, :split], y[:, :split], forecast_length=self.prediction_length, context_length=self.context_length
+        )
+        scaler = ZScaler.from_data(fit_set)
+        fit_set.set_transform(scaler)
+        validation_set = DLDataSet(
+            x[:, split:], y[:, split:], forecast_length=self.prediction_length, context_length=self.context_length
+        )
+        validation_set.set_transform(scaler)
+        return SimpleDataLoader(fit_set), SimpleDataLoader(validation_set)
+
     def train(self, data: pd.DataFrame) -> FlaxPredictor:
         """Fit the model and return a predictor.
 
@@ -416,9 +491,11 @@ class AutoRegressiveModel:
             parameters and the fitted scaler.
         """
         self._locations = sorted(data["location"].unique())
+        self._n_locations = data["location"].nunique()
         data_set = self._get_dataset(data)
         self._transform = ZScaler.from_data(data_set)
         data_set.set_transform(self._transform)
+        early_stopping_loaders = self._early_stopping_loaders(data)
         # Standardize the validation window with the same fitted scaler, otherwise
         # its features stay on the raw scale and the reported validation loss is
         # not comparable to the training loss.
@@ -429,16 +506,38 @@ class AutoRegressiveModel:
                     f"{self._locations}, but got {self._validation_locations}"
                 )
             self._validation_loader.dataset.set_transform(self._transform)
-        self._n_locations = data["location"].nunique()
         data_loader = SimpleDataLoader(data_set)
         params_list = []
         for member in range(max(1, self.n_ensemble)):
+            seed = self.seed_offset + member
+            n_iter = self.n_iter
+            if early_stopping_loaders is not None:
+                fit_loader, validation_loader = early_stopping_loaders
+                probe = Trainer(
+                    self.model,
+                    self.n_iter,
+                    learning_rate=self.learning_rate,
+                    validation_loader=validation_loader,
+                    seed=seed,
+                    eval_every=self.eval_every,
+                    patience=self.patience,
+                )
+                probe.train(fit_loader, self._loss)
+                n_iter = max(probe.best_epoch or 0, 1)
+                logger.info(
+                    "member %d: best validation loss %.4f at epoch %d; refitting on the full series",
+                    member,
+                    probe.best_validation_loss,
+                    n_iter,
+                )
             trainer = Trainer(
                 self.model,
-                self.n_iter,
+                n_iter,
                 learning_rate=self.learning_rate,
-                validation_loader=self._validation_loader,
-                seed=member,
+                validation_loader=None if early_stopping_loaders is not None else self._validation_loader,
+                seed=seed,
+                eval_every=self.eval_every,
+                patience=self.patience,
             )
             params_list.append(trainer.train(data_loader, self._loss).params)
         self._params = params_list[0]
